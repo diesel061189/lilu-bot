@@ -79,9 +79,9 @@ async def text_to_speech(text: str) -> bytes:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "playai-tts",
+                "model": "canopylabs/orpheus-v1-english",
                 "input": text,
-                "voice": "Aaliyah-PlayAI",
+                "voice": "hannah",
                 "response_format": "mp3"
             }
         )
