@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 conversation_history = {}
 
@@ -31,7 +33,6 @@ LILU_SYSTEM_PROMPT = """Ты — Лилу, лучшая подруга Артё�
 
 
 async def speech_to_text(audio_path: str) -> str:
-    """Голос в текст через Groq Whisper"""
     async with httpx.AsyncClient(timeout=30) as client:
         with open(audio_path, "rb") as f:
             response = await client.post(
@@ -41,12 +42,10 @@ async def speech_to_text(audio_path: str) -> str:
                 data={"model": "whisper-large-v3", "language": "ru"}
             )
         result = response.json()
-        logger.info(f"STT response: {result}")
         return result["text"]
 
 
 async def get_lilu_response(user_id: int, user_message: str) -> str:
-    """Ответ Лилу через Groq"""
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
@@ -64,35 +63,66 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
             json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 500}
         )
         result = response.json()
-        logger.info(f"Groq response: {result}")
-
         if "choices" not in result:
             raise Exception(f"Groq error: {result.get('error', {}).get('message', str(result))}")
-
         lilu_text = result["choices"][0]["message"]["content"]
 
     conversation_history[user_id].append({"role": "assistant", "content": lilu_text})
     return lilu_text
 
 
-async def text_to_speech(text: str) -> bytes:
-    """Текст в голос через Google TTS — бесплатно и без лимитов"""
+async def text_to_speech_elevenlabs(text: str) -> bytes:
+    """ElevenLabs — живой эмоциональный голос"""
     async with httpx.AsyncClient(timeout=30) as client:
-        params = {
-            "ie": "UTF-8",
-            "q": text,
-            "tl": "ru",
-            "client": "tw-ob",
-            "ttsspeed": "0.9"
-        }
-        response = await client.get(
-            "https://translate.google.com/translate_tts",
-            params=params,
-            headers={"User-Agent": "Mozilla/5.0"}
+        response = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": 0.4,
+                    "similarity_boost": 0.8,
+                    "style": 0.5,
+                    "use_speaker_boost": True
+                }
+            }
         )
+        logger.info(f"ElevenLabs status: {response.status_code}")
         if response.status_code != 200:
-            raise Exception(f"TTS error {response.status_code}")
+            raise Exception(f"ElevenLabs {response.status_code}: {response.text[:300]}")
         return response.content
+
+
+async def text_to_speech_google(text: str) -> bytes:
+    """Google TTS — запасной вариант"""
+    max_len = 190
+    parts = []
+    words = text.split()
+    current = ""
+    for word in words:
+        if len(current) + len(word) + 1 <= max_len:
+            current += (" " + word) if current else word
+        else:
+            if current:
+                parts.append(current)
+            current = word
+    if current:
+        parts.append(current)
+
+    audio_chunks = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for part in parts:
+            response = await client.get(
+                "https://translate.google.com/translate_tts",
+                params={"ie": "UTF-8", "q": part, "tl": "ru", "client": "tw-ob"},
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            audio_chunks.append(response.content)
+    return b"".join(audio_chunks)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,33 +145,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lilu_response = await get_lilu_response(user_id, user_text)
-        logger.info(f"Лилу отвечает: {lilu_response}")
+        logger.info(f"Лилу: {lilu_response}")
 
-        # Разбиваем длинный текст на части (Google TTS лимит ~200 символов)
-        max_len = 190
-        parts = []
-        words = lilu_response.split()
-        current = ""
-        for word in words:
-            if len(current) + len(word) + 1 <= max_len:
-                current += (" " + word) if current else word
-            else:
-                if current:
-                    parts.append(current)
-                current = word
-        if current:
-            parts.append(current)
-
-        # Собираем аудио по частям
-        audio_chunks = []
-        for part in parts:
-            chunk = await text_to_speech(part)
-            audio_chunks.append(chunk)
-
-        full_audio = b"".join(audio_chunks)
+        # Пробуем ElevenLabs, при ошибке — Google TTS
+        try:
+            audio_data = await text_to_speech_elevenlabs(lilu_response)
+            logger.info("ElevenLabs сработал!")
+        except Exception as e:
+            logger.error(f"ElevenLabs не сработал: {e}, переключаемся на Google TTS")
+            audio_data = await text_to_speech_google(lilu_response)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(full_audio)
+            tmp.write(audio_data)
             tmp_path = tmp.name
 
         with open(tmp_path, "rb") as audio_file:
@@ -149,8 +164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
 
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        # При любой ошибке — отвечаем текстом
+        logger.error(f"Общая ошибка: {e}")
         try:
             lilu_response = await get_lilu_response(user_id, update.message.text or "привет")
             await update.message.reply_text(lilu_response)
