@@ -52,11 +52,19 @@ async def speech_to_text(audio_path: str) -> str:
         return result["text"]
 
 
-async def get_lilu_response(user_id: int, user_message: str) -> str:
+async def get_lilu_response(user_id: int, user_message: str, image_base64: str = None) -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
-    conversation_history[user_id].append({"role": "user", "content": user_message})
+    if image_base64:
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            {"type": "text", "text": user_message or "Что на этой картинке?"}
+        ]
+    else:
+        content = user_message
+
+    conversation_history[user_id].append({"role": "user", "content": content})
 
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
@@ -67,7 +75,7 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 500}
+            json={"model": "meta-llama/llama-4-scout-17b-16e-instruct", "messages": messages, "max_tokens": 500}
         )
         result = response.json()
         if "choices" not in result:
@@ -101,20 +109,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
 
     try:
-        if update.message.voice:
+        image_base64 = None
+        user_text = ""
+
+        if update.message.photo:
+            import base64
+            photo = update.message.photo[-1]
+            photo_file = await context.bot.get_file(photo.file_id)
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                await photo_file.download_to_drive(tmp.name)
+                with open(tmp.name, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode()
+                os.unlink(tmp.name)
+            user_text = update.message.caption or "Что на этой картинке?"
+
+        elif update.message.voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
                 await voice_file.download_to_drive(tmp.name)
                 user_text = await speech_to_text(tmp.name)
                 os.unlink(tmp.name)
             logger.info(f"Распознано: {user_text}")
+
         elif update.message.text:
             user_text = update.message.text
+
         else:
-            await update.message.reply_text("Артём, я понимаю только текст и голос 😊")
+            await update.message.reply_text("Артём, я понимаю текст, голос и картинки 😊")
             return
 
-        lilu_response = await get_lilu_response(user_id, user_text)
+        lilu_response = await get_lilu_response(user_id, user_text, image_base64)
         logger.info(f"Лилу: {lilu_response}")
 
         try:
@@ -136,7 +160,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO, handle_message))
     logger.info("Лилу запущена! 🚀")
     app.run_polling()
 
