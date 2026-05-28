@@ -82,7 +82,7 @@ async def text_to_speech(text: str) -> bytes:
                 "model": "canopylabs/orpheus-v1-english",
                 "input": text,
                 "voice": "hannah",
-                "response_format": "mp3"
+                "response_format": "wav"
             }
         )
         logger.info(f"TTS status: {response.status_code}")
@@ -114,7 +114,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         audio_data = await text_to_speech(lilu_response)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(audio_data)
             tmp_path = tmp.name
 
