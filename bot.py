@@ -81,7 +81,7 @@ async def text_to_speech(text: str) -> bytes:
             json={
                 "model": "canopylabs/orpheus-v1-english",
                 "input": text,
-                "voice": "hannah",
+                "voice": "luna",
                 "response_format": "wav"
             }
         )
