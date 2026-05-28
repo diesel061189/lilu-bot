@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
@@ -33,61 +33,66 @@ LILU_SYSTEM_PROMPT = """Ты — Лилу, лучшая подруга Артё�
 
 
 async def speech_to_text(audio_path: str) -> str:
-    import base64
-    with open(audio_path, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode()
-
+    """Голос в текст через Groq Whisper"""
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [
-                {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}},
-                {"text": "Транскрибируй это аудио на русском языке. Напиши только текст, без пояснений."}
-            ]}]}
-        )
+        with open(audio_path, "rb") as f:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.ogg", f, "audio/ogg")},
+                data={"model": "whisper-large-v3", "language": "ru"}
+            )
         result = response.json()
         logger.info(f"STT response: {result}")
-        return result["candidates"][0]["content"]["parts"][0]["text"]
+        return result["text"]
 
 
 async def get_lilu_response(user_id: int, user_message: str) -> str:
+    """Ответ Лилу через Groq"""
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
     conversation_history[user_id].append({
         "role": "user",
-        "parts": [{"text": user_message}]
+        "content": user_message
     })
 
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
+    messages = [{"role": "system", "content": LILU_SYSTEM_PROMPT}] + conversation_history[user_id]
+
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
             json={
-                "system_instruction": {"parts": [{"text": LILU_SYSTEM_PROMPT}]},
-                "contents": conversation_history[user_id]
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "max_tokens": 500
             }
         )
         result = response.json()
-        logger.info(f"Gemini response: {result}")
+        logger.info(f"Groq response: {result}")
 
-        if "candidates" not in result:
-            error_msg = result.get("error", {}).get("message", str(result))
-            raise Exception(f"Gemini error: {error_msg}")
+        if "choices" not in result:
+            raise Exception(f"Groq error: {result.get('error', {}).get('message', str(result))}")
 
-        lilu_text = result["candidates"][0]["content"]["parts"][0]["text"]
+        lilu_text = result["choices"][0]["message"]["content"]
 
     conversation_history[user_id].append({
-        "role": "model",
-        "parts": [{"text": lilu_text}]
+        "role": "assistant",
+        "content": lilu_text
     })
 
     return lilu_text
 
 
 async def text_to_speech(text: str) -> bytes:
+    """Текст в голос через ElevenLabs"""
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
