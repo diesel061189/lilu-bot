@@ -39,7 +39,7 @@ async def speech_to_text(audio_path: str) -> str:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": [{"parts": [
                 {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}},
                 {"text": "Транскрибируй это аудио на русском языке. Напиши только текст, без пояснений."}
@@ -64,7 +64,7 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={
                 "system_instruction": {"parts": [{"text": LILU_SYSTEM_PROMPT}]},
                 "contents": conversation_history[user_id]
