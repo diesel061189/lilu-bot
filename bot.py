@@ -10,8 +10,6 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 conversation_history = {}
 
@@ -52,10 +50,7 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_message
-    })
+    conversation_history[user_id].append({"role": "user", "content": user_message})
 
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
@@ -65,15 +60,8 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "max_tokens": 500
-            }
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 500}
         )
         result = response.json()
         logger.info(f"Groq response: {result}")
@@ -83,35 +71,34 @@ async def get_lilu_response(user_id: int, user_message: str) -> str:
 
         lilu_text = result["choices"][0]["message"]["content"]
 
-    conversation_history[user_id].append({
-        "role": "assistant",
-        "content": lilu_text
-    })
-
+    conversation_history[user_id].append({"role": "assistant", "content": lilu_text})
     return lilu_text
 
 
 async def text_to_speech(text: str) -> bytes:
-    """Текст в голос через ElevenLabs"""
+    """Текст в голос через Google TTS — бесплатно и без лимитов"""
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={"xi-api-key": ELEVENLABS_API_KEY},
-            json={
-                "text": text,
-                "model_id": "eleven_multilingual_v2",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.3}
-            }
+        params = {
+            "ie": "UTF-8",
+            "q": text,
+            "tl": "ru",
+            "client": "tw-ob",
+            "ttsspeed": "0.9"
+        }
+        response = await client.get(
+            "https://translate.google.com/translate_tts",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"}
         )
         if response.status_code != 200:
-            raise Exception(f"ElevenLabs error {response.status_code}: {response.text[:200]}")
+            raise Exception(f"TTS error {response.status_code}")
         return response.content
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
 
     try:
         if update.message.voice:
@@ -128,22 +115,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lilu_response = await get_lilu_response(user_id, user_text)
+        logger.info(f"Лилу отвечает: {lilu_response}")
 
-        try:
-            audio_data = await text_to_speech(lilu_response)
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                tmp.write(audio_data)
-                tmp_path = tmp.name
-            with open(tmp_path, "rb") as audio_file:
-                await update.message.reply_voice(voice=audio_file)
-            os.unlink(tmp_path)
-        except Exception as e:
-            logger.error(f"Ошибка голоса: {e}")
-            await update.message.reply_text(lilu_response)
+        # Разбиваем длинный текст на части (Google TTS лимит ~200 символов)
+        max_len = 190
+        parts = []
+        words = lilu_response.split()
+        current = ""
+        for word in words:
+            if len(current) + len(word) + 1 <= max_len:
+                current += (" " + word) if current else word
+            else:
+                if current:
+                    parts.append(current)
+                current = word
+        if current:
+            parts.append(current)
+
+        # Собираем аудио по частям
+        audio_chunks = []
+        for part in parts:
+            chunk = await text_to_speech(part)
+            audio_chunks.append(chunk)
+
+        full_audio = b"".join(audio_chunks)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(full_audio)
+            tmp_path = tmp.name
+
+        with open(tmp_path, "rb") as audio_file:
+            await update.message.reply_voice(voice=audio_file)
+        os.unlink(tmp_path)
 
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        await update.message.reply_text(f"Ошибка: {str(e)[:200]}")
+        # При любой ошибке — отвечаем текстом
+        try:
+            lilu_response = await get_lilu_response(user_id, update.message.text or "привет")
+            await update.message.reply_text(lilu_response)
+        except Exception as e2:
+            await update.message.reply_text(f"Ошибка: {str(e2)[:200]}")
 
 
 def main():
