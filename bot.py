@@ -2,6 +2,7 @@ import os
 import logging
 import tempfile
 import httpx
+import subprocess
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -117,12 +118,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             audio_data = await text_to_speech(lilu_response)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(audio_data)
-                tmp_path = tmp.name
-            with open(tmp_path, "rb") as audio_file:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_tmp:
+                wav_tmp.write(audio_data)
+                wav_path = wav_tmp.name
+
+            # Конвертируем WAV в OGG для красивого отображения в Telegram
+            ogg_path = wav_path.replace(".wav", ".ogg")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", wav_path,
+                "-c:a", "libopus", "-b:a", "64k", ogg_path
+            ], capture_output=True)
+            os.unlink(wav_path)
+
+            with open(ogg_path, "rb") as audio_file:
                 await update.message.reply_voice(voice=audio_file)
-            os.unlink(tmp_path)
+            os.unlink(ogg_path)
         except Exception as e:
             logger.error(f"TTS ошибка: {e}")
             await update.message.reply_text(lilu_response)
