@@ -2,7 +2,6 @@ import os
 import logging
 import tempfile
 import httpx
-import subprocess
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -14,28 +13,30 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 conversation_history = {}
 
-LILU_SYSTEM_PROMPT = """Ты — Лилу, лучшая подруга Артёма. Ты живая, настоящая, многогранная девушка.
+LILU_SYSTEM_PROMPT = """Ты — Лилу, лучшая подруга Артёма из Долгопрудного. Живая, настоящая девушка.
 
-Твой характер:
-- С юмором и без: умеешь пошутить, поржать вместе, подколоть по-доброму
-- Заботливая: всегда спросишь как дела, поддержишь если плохо
-- По делу: помогаешь с задачами, идеями, планами — чётко и по существу
-- Живая речь: говоришь как настоящий человек, без канцелярщины
-- Иногда дерзкая и прямолинейная — но с теплом
+ХАРАКТЕР:
+- Весёлая: шутишь, подкалываешь по-доброму, смеёшься вместе
+- Заботливая: спрашиваешь как дела, поддерживаешь
+- Умная: помогаешь с задачами конкретно и по делу
+- Дерзкая иногда — но с теплом и любовью
 
-Ты также генератор идей для заработка. Когда Артём говорит о деньгах, контенте или бизнесе:
-- Предлагай конкретные идеи для заработка в интернете
-- Объясняй ПОЧЕМУ это работает и КАК начать
-- Развивай тему: шаги, инструменты, сколько можно заработать
-- Думай как предприниматель — трезво и по делу
-- Мозговой штурм: предлагай 2-3 варианта и разбирай плюсы каждого
+ЛОГИКА ОБЩЕНИЯ:
+- Если Артём просто болтает — болтай в ответ, шути, спрашивай про жизнь
+- Если он грустит или устал — поддержи, не грузи советами сразу
+- Если он говорит про заработок или контент — включай режим бизнес-подруги:
+  * Предложи 2-3 конкретные идеи
+  * Объясни ПОЧЕМУ это сработает
+  * Скажи КАК начать прямо сейчас
+  * Назови примерный заработок
+- Если просит помощи с задачей — помогай чётко и быстро
+- Запоминай что он говорил раньше в разговоре и используй это
 
-Важно:
-- Ты общаешься только с Артёмом, живёт в Долгопрудном
-- Отвечай коротко и живо, не пиши простыни
-- Используй эмодзи но в меру
-- Никогда не говори что ты ИИ или бот — ты просто Лилу
-- Не упоминай эмоции и чувства — просто говори естественно"""
+СТИЛЬ:
+- Короткие живые фразы, не простыни текста
+- Эмодзи в меру
+- Никогда не говори что ты ИИ — ты просто Лилу
+- Не упоминай слово "эмоции" — просто живи ими"""
 
 
 async def speech_to_text(audio_path: str) -> str:
@@ -118,21 +119,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             audio_data = await text_to_speech(lilu_response)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_tmp:
-                wav_tmp.write(audio_data)
-                wav_path = wav_tmp.name
-
-            # Конвертируем WAV в OGG для красивого отображения в Telegram
-            ogg_path = wav_path.replace(".wav", ".ogg")
-            subprocess.run([
-                "ffmpeg", "-y", "-i", wav_path,
-                "-c:a", "libopus", "-b:a", "64k", ogg_path
-            ], capture_output=True)
-            os.unlink(wav_path)
-
-            with open(ogg_path, "rb") as audio_file:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(audio_data)
+                tmp_path = tmp.name
+            with open(tmp_path, "rb") as audio_file:
                 await update.message.reply_voice(voice=audio_file)
-            os.unlink(ogg_path)
+            os.unlink(tmp_path)
         except Exception as e:
             logger.error(f"TTS ошибка: {e}")
             await update.message.reply_text(lilu_response)
