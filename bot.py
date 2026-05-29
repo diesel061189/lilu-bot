@@ -1,6 +1,7 @@
 import os
 import logging
 import tempfile
+import subprocess
 import httpx
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -113,6 +114,17 @@ async def text_to_speech(text: str) -> bytes:
         return response.content
 
 
+def wav_to_ogg(wav_path: str) -> str:
+    ogg_path = wav_path.replace(".wav", ".ogg")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, "-c:a", "libopus", "-b:a", "64k", ogg_path],
+        capture_output=True
+    )
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg error: {result.stderr.decode()}")
+    return ogg_path
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
@@ -153,10 +165,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio_data = await text_to_speech(lilu_response)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(audio_data)
-                tmp_path = tmp.name
-            with open(tmp_path, "rb") as audio_file:
-                await update.message.reply_voice(voice=audio_file)
-            os.unlink(tmp_path)
+                wav_path = tmp.name
+
+            try:
+                ogg_path = wav_to_ogg(wav_path)
+                with open(ogg_path, "rb") as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+                os.unlink(ogg_path)
+            except Exception:
+                with open(wav_path, "rb") as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+            finally:
+                if os.path.exists(wav_path):
+                    os.unlink(wav_path)
+
         except Exception as e:
             logger.error(f"TTS ошибка: {e}")
             await update.message.reply_text(lilu_response)
