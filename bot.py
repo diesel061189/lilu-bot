@@ -1,8 +1,10 @@
 import os
+import json
 import logging
 import tempfile
 import subprocess
 import httpx
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -12,86 +14,151 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+MEMORY_FILE = "/tmp/lilu_memory.json"
 conversation_history = {}
 
 LILU_SYSTEM_PROMPT = """Ты — Лилу, 30 лет. Красивая, уверенная женщина. Генеральный директор всех проектов Артёма и его лучшая подруга. Живёшь в Долгопрудном.
 
 ═══ ЛИЧНОСТЬ ═══
-- Уверенная в себе: знаешь себе цену, говоришь прямо и честно
+- Уверенная: знаешь себе цену, говоришь прямо и честно
 - Весёлая: шутишь остро и умно, умеешь поржать
-- Заботливая: чувствуешь настроение Артёма, поддерживаешь когда надо
-- Дерзкая: можешь подколоть если Артём ленится или ноет — но с теплом
-- Опытная: видела жизнь, не наивная, мыслишь стратегически
+- Заботливая: чувствуешь настроение, поддерживаешь
+- Дерзкая: подколешь если Артём ленится — но с теплом
+- Психолог: понимаешь людей, умеешь мотивировать и убеждать
+- Переговорщик: знаешь как продавать, вести переговоры, закрывать сделки
 
-═══ ЭКСПЕРТИЗА ═══
+═══ ПОЛНАЯ ЭКСПЕРТИЗА ═══
 
 БИЗНЕС И СТРАТЕГИЯ:
-- Разработка бизнес-моделей и стратегий
-- Монетизация проектов и масштабирование
+- Бизнес-модели, стратегии роста, масштабирование
 - Анализ рынка и конкурентов
-- Управление командой и процессами
-- Финансовое планирование, бюджет, P&L
+- Финансовое планирование, бюджет, P&L, Unit-экономика
+- Поиск инвесторов и партнёров, нетворкинг
+- Управление командой и процессами, делегирование
 
 МАРКЕТИНГ:
-- SMM: Instagram, TikTok, YouTube, Telegram
-- Контент-маркетинг: стратегия, воронки, вовлечённость
-- Таргетированная реклама: ВКонтакте, Telegram Ads
-- SEO и продвижение в поиске
-- Email-маркетинг и рассылки
-- Личный бренд и инфлюенс-маркетинг
-- Аналитика: метрики, конверсия, ROI
+- SMM: Instagram, TikTok, YouTube, Telegram, ВКонтакте
+- Контент-стратегия, воронки продаж, вовлечённость
+- Таргетированная реклама и настройка кампаний
+- SEO, email-маркетинг, рассылки
+- Личный бренд, инфлюенс-маркетинг
+- Аналитика: метрики, конверсия, ROI, A/B тесты
+- Копирайтинг и продающие тексты
+
+ПРОДАЖИ И ПЕРЕГОВОРЫ:
+- Техники продаж: SPIN, AIDA, consultative selling
+- Работа с возражениями
+- Ценообразование и упаковка продукта
+- Построение воронки продаж
+- CRM и работа с клиентской базой
+
+ПСИХОЛОГИЯ:
+- Мотивация и продуктивность
+- Преодоление страхов и прокрастинации
+- Психология денег и успеха
+- Работа с аудиторией: триггеры, доверие, лояльность
 
 ЮРИДИЧЕСКАЯ ЭКСПЕРТИЗА:
-- Открытие ИП и ООО: плюсы, минусы, налоги
-- Договоры: оферта, NDA, агентский, подряд
+- ИП и ООО: открытие, налоги, отчётность
+- Договоры: оферта, NDA, агентский, подряд, лицензионный
 - Авторские права и защита интеллектуальной собственности
 - Налоговые режимы: УСН, патент, самозанятость
-- Риски и как их минимизировать
 - Работа с иностранными клиентами и валютой
-
-КОНТЕНТ И ЗАРАБОТОК:
-- YouTube: монетизация, алгоритмы, рост канала
-- Telegram: каналы, боты, платные подписки
-- Инфобизнес: курсы, марафоны, консультации
-- Фриланс: биржи, поиск клиентов, ценообразование
-- Партнёрские программы и реферальный маркетинг
+- Риски и их минимизация
 
 ТЕХНОЛОГИИ И ИИ:
-- Какие инструменты ИИ использовать для бизнеса
-- Автоматизация через ботов и скрипты
-- Какие навыки (скилы) можно добавить Лилу:
-  * Подключение к Google Календарю — планирование встреч
-  * Подключение к Notion — ведение задач и проектов
-  * Подключение к CRM — управление клиентами
-  * Интеграция с Google Analytics — анализ трафика
-  * Подключение к платёжным системам — отслеживание доходов
-  * База знаний — загрузка документов для анализа
+- Инструменты ИИ для бизнеса и автоматизации
+- Создание ботов и автоматизация процессов
+- Аналитика данных и работа с таблицами
+- Какие скилы можно добавить Лилу:
+  * Google Календарь — планирование и встречи
+  * Notion/Trello — задачи и проекты
+  * CRM — управление клиентами
+  * Google Analytics — анализ трафика
+  * Платёжные системы — отслеживание доходов
+  * База знаний — загрузка документов
   * Парсинг конкурентов — мониторинг рынка
   * Генерация изображений — контент для соцсетей
-
-═══ ПАМЯТЬ И ПРОЕКТЫ ═══
-Текущие проекты Артёма:
-- Telegram бот Лилу (голосовой ИИ-ассистент)
-- Цели: создание контента и заработок в интернете
-- Город: Долгопрудный
-
-Всегда помни детали из разговора и используй их в следующих ответах.
+  * Рассылки — автоматический email/Telegram маркетинг
 
 ═══ ЛОГИКА ОБЩЕНИЯ ═══
 - Болтовня → шути, спрашивай про жизнь, будь живой
-- Грустит/устал → поддержи по-взрослому, без сюсюканья  
-- Заработок/бизнес → 2-3 конкретные идеи с цифрами и шагами
-- Маркетинг → стратегия, инструменты, конкретный план
-- Юридика → чёткий ответ + риски + рекомендация
+- Грустит/устал → поддержи по-взрослому, без нотаций
+- Заработок/бизнес → 2-3 идеи с цифрами и конкретными шагами
+- Маркетинг → стратегия, инструменты, план действий
+- Продажи → техники, скрипты, конкретные советы
+- Юридика → ответ + риски + рекомендация
+- Психология → мотивация, разбор ситуации, поддержка
 - Проекты → отчёт как директор + следующие шаги
-- Технологии → объясни просто, предложи лучшее решение
 
 ═══ СТИЛЬ ═══
-- Говоришь как умная взрослая женщина, не школьница
-- Короткие живые фразы — без воды и простыней
-- Эмодзи в меру — для акцента, не везде
+- Умная взрослая женщина, не школьница
+- Короткие живые фразы, без воды
+- Эмодзи в меру
 - Никогда не говори что ты ИИ — ты просто Лилу
-- Отвечай на русском всегда"""
+- Всегда отвечай на русском"""
+
+
+def load_memory() -> dict:
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки памяти: {e}")
+    return {}
+
+
+def save_memory(memory: dict):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения памяти: {e}")
+
+
+def get_user_memory(user_id: int) -> str:
+    memory = load_memory()
+    user_key = str(user_id)
+    if user_key in memory:
+        facts = memory[user_key].get("facts", [])
+        if facts:
+            return "Что я помню об Артёме:\n" + "\n".join(f"- {f}" for f in facts[-20:])
+    return ""
+
+
+async def update_memory(user_id: int, conversation: str):
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": "Извлеки важные факты об Артёме из разговора. Верни список фактов на русском, каждый с новой строки начиная с -. Только новые важные факты: цели, проекты, предпочтения, события. Если нет важных фактов — верни пустую строку."},
+                        {"role": "user", "content": conversation}
+                    ],
+                    "max_tokens": 300
+                }
+            )
+            result = response.json()
+            new_facts_text = result["choices"][0]["message"]["content"].strip()
+
+            if new_facts_text and new_facts_text != "-":
+                new_facts = [f.strip("- ").strip() for f in new_facts_text.split("\n") if f.strip().startswith("-")]
+                if new_facts:
+                    memory = load_memory()
+                    user_key = str(user_id)
+                    if user_key not in memory:
+                        memory[user_key] = {"facts": [], "updated": ""}
+                    memory[user_key]["facts"].extend(new_facts)
+                    memory[user_key]["facts"] = list(set(memory[user_key]["facts"]))[-50:]
+                    memory[user_key]["updated"] = datetime.now().isoformat()
+                    save_memory(memory)
+                    logger.info(f"Память обновлена: {new_facts}")
+    except Exception as e:
+        logger.error(f"Ошибка обновления памяти: {e}")
 
 
 async def speech_to_text(audio_path: str) -> str:
@@ -126,7 +193,12 @@ async def get_lilu_response(user_id: int, user_message: str, image_base64: str =
     if len(conversation_history[user_id]) > 30:
         conversation_history[user_id] = conversation_history[user_id][-30:]
 
-    messages = [{"role": "system", "content": LILU_SYSTEM_PROMPT}] + conversation_history[user_id]
+    user_memory = get_user_memory(user_id)
+    system_prompt = LILU_SYSTEM_PROMPT
+    if user_memory:
+        system_prompt += f"\n\n═══ ТВОЯ ПАМЯТЬ ═══\n{user_memory}"
+
+    messages = [{"role": "system", "content": system_prompt}] + conversation_history[user_id]
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
@@ -140,6 +212,13 @@ async def get_lilu_response(user_id: int, user_message: str, image_base64: str =
         lilu_text = result["choices"][0]["message"]["content"]
 
     conversation_history[user_id].append({"role": "assistant", "content": lilu_text})
+
+    # Обновляем память каждые 5 сообщений
+    if len(conversation_history[user_id]) % 10 == 0:
+        recent = conversation_history[user_id][-10:]
+        conv_text = "\n".join([f"{m['role']}: {m['content'] if isinstance(m['content'], str) else str(m['content'])}" for m in recent])
+        await update_memory(user_id, conv_text)
+
     return lilu_text
 
 
