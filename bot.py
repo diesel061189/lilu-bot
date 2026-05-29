@@ -188,7 +188,9 @@ async def get_lilu_response(user_id: int, user_message: str, image_base64: str =
         content = user_message
         model = "llama-3.3-70b-versatile"
 
-    conversation_history[user_id].append({"role": "user", "content": content})
+    # Сохраняем только текст в историю для совместимости
+    history_content = user_message if user_message else "картинка"
+    conversation_history[user_id].append({"role": "user", "content": history_content})
 
     if len(conversation_history[user_id]) > 30:
         conversation_history[user_id] = conversation_history[user_id][-30:]
