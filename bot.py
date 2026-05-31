@@ -195,6 +195,31 @@ async def anthropic_request(
 
 # ═══ БАЗА ДАННЫХ ═══
 
+def init_db():
+    """Создаём таблицы если их нет — на случай если Лила стартует первой"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY, title TEXT, description TEXT,
+            budget TEXT, url TEXT, source TEXT,
+            status TEXT DEFAULT 'found', result TEXT,
+            created_at TEXT, updated_at TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS seen_jobs (url TEXT PRIMARY KEY, seen_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount_usd REAL DEFAULT 0,
+            amount_rub REAL DEFAULT 0,
+            description TEXT,
+            created_at TEXT
+        )''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ БД инициализирована")
+    except Exception as e:
+        logger.error(f"init_db ошибка: {e}")
+
 def get_stats() -> str:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -870,6 +895,7 @@ async def lilu_db_poll_loop(bot):
 # ═══ ЗАПУСК ═══
 
 def main():
+    init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  start_command))
