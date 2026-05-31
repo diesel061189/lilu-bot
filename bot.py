@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 import tempfile
 import subprocess
 import httpx
@@ -784,6 +785,88 @@ async def receive_work_for_review(bot, job_title: str, result: str, job_id: str,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+# ═══ ОПРОС БД — ЛИЛА ЧИТАЕТ ЗАКАЗЫ ОТ БОТОВ ═══
+
+def get_pending_jobs() -> list:
+    """Достаём заказы со статусом pending_lilu из БД"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''SELECT id, title, description, budget, url, source, status,
+                     created_at, updated_at
+                     FROM jobs WHERE status = "pending_lilu"
+                     ORDER BY created_at ASC LIMIT 10''')
+        rows = c.fetchall()
+        conn.close()
+        jobs = []
+        for row in rows:
+            jobs.append({
+                'id':          row[0],
+                'title':       row[1],
+                'description': row[2],
+                'budget':      row[3],
+                'url':         row[4],
+                'source':      row[5],
+                'status':      row[6],
+                'created_at':  row[7],
+                'updated_at':  row[8],
+            })
+        return jobs
+    except Exception as e:
+        logger.error(f"get_pending_jobs ошибка: {e}")
+        return []
+
+def mark_job_processing(job_id: str):
+    """Помечаем заказ как обрабатываемый чтобы не взять дважды"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE jobs SET status='lilu_processing', updated_at=? WHERE id=?",
+                  (datetime.now().isoformat(), job_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"mark_job_processing ошибка: {e}")
+
+def get_job_source_bot(job_id: str) -> str:
+    """Получаем source_bot из поля source в БД"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT source FROM jobs WHERE id=?", (job_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            src = row[0] or ""
+            if "Карточник" in src:
+                return "Карточник"
+            if "Полифан" in src:
+                return "Полифан"
+        return "Бот"
+    except:
+        return "Бот"
+
+async def lilu_db_poll_loop(bot):
+    """
+    Лила каждые 30 сек смотрит в БД на новые заказы.
+    Это главный способ получать заказы от Полифана и Карточника.
+    """
+    await asyncio.sleep(15)  # небольшая пауза при старте
+    while True:
+        try:
+            jobs = get_pending_jobs()
+            if jobs:
+                logger.info(f"👑 Лила нашла {len(jobs)} новых заказов в БД")
+            for job in jobs:
+                # Сразу помечаем чтобы не взять дважды
+                mark_job_processing(job['id'])
+                source_bot = get_job_source_bot(job['id'])
+                await process_incoming_job(bot, job, source_bot)
+                await asyncio.sleep(2)  # пауза между заказами
+        except Exception as e:
+            logger.error(f"❌ Лила DB poll ошибка: {e}")
+        await asyncio.sleep(30)  # проверяем каждые 30 сек
+
 # ═══ ЗАПУСК ═══
 
 def main():
@@ -798,11 +881,21 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO, handle_message))
 
     async def post_init(application):
+        # Запускаем опрос БД как фоновую задачу
+        asyncio.create_task(lilu_db_poll_loop(application.bot))
+        logger.info("✅ Лила: опрос БД запущен каждые 30 сек")
         try:
             if YOUR_CHAT_ID:
                 await application.bot.send_message(
                     chat_id=YOUR_CHAT_ID,
-                    text="👑 *Лила запущена!*\n\n⚡️ Работаю на Anthropic Claude\n✅ Готова фильтровать заказы и проверять работы 🌍",
+                    text=(
+                        "👑 *Лила запущена!*\n\n"
+                        "⚡️ Работаю на Anthropic Claude\n"
+                        "✅ Слежу за заказами в БД каждые 30 сек\n"
+                        "🔍 Проверяю тексты на любом языке\n\n"
+                        "/stats — статистика\n"
+                        "/check — проверить текст"
+                    ),
                     parse_mode='Markdown'
                 )
         except:
