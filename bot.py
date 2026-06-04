@@ -8,6 +8,8 @@ import httpx
 import sqlite3
 import base64
 import re
+import random
+import pytz
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -28,10 +30,27 @@ MINIMAX_API_KEY   = os.getenv("MINIMAX_API_KEY", "")
 KIE_API_KEY       = os.getenv("KIE_API_KEY", "")
 KIE_BASE          = "https://api.kie.ai"
 
-# ═══ GROQ — БЕСПЛАТНО ═══
-GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL        = "llama-3.3-70b-versatile"
-GROQ_MODEL_FAST   = "llama-3.1-8b-instant"
+# ═══ GROQ — РОТАЦИЯ МОДЕЛЕЙ (НОВОЕ) ═══
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
+]
+GROQ_MODEL      = "llama-3.3-70b-versatile"
+GROQ_MODEL_FAST = "llama-3.1-8b-instant"
+_groq_model_index = 0
+
+# ═══ ВРЕМЯ МСК (НОВОЕ) ═══
+def msk_now() -> datetime:
+    return datetime.now(pytz.timezone('Europe/Moscow'))
+
+def msk_time_str() -> str:
+    return msk_now().strftime("%d.%m.%Y %H:%M МСК")
+
+def msk_hour() -> int:
+    return msk_now().hour
 
 MEMORY_FILE = "/tmp/lilu_memory.json"
 conversation_history = {}
@@ -154,25 +173,78 @@ Basic $4.99 / Standard $14.99 / Premium $34.99 / VIP $59.99
 - Никогда не говори что ты ИИ
 - Как умный близкий человек, не как энциклопедия"""
 
-# ═══ GROQ API ХЕЛПЕР ═══
+# ═══ GROQ API — РОТАЦИЯ МОДЕЛЕЙ (НОВОЕ) ═══
 
 async def groq_request(messages: list, system: str = "", model: str = None, max_tokens: int = 800) -> str:
-    if model is None:
-        model = GROQ_MODEL
-    msgs = []
-    if system:
-        msgs.append({"role": "system", "content": system})
-    msgs.extend(messages)
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": model, "messages": msgs, "max_tokens": max_tokens}
-        )
-        data = r.json()
-        if "choices" not in data:
-            raise Exception(f"Groq error: {data}")
-        return data["choices"][0]["message"]["content"].strip()
+    global _groq_model_index
+    models_to_try = GROQ_MODELS if model is None else [model]
+    
+    for attempt in range(len(GROQ_MODELS)):
+        current_model = GROQ_MODELS[_groq_model_index] if model is None else model
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.extend(messages)
+        try:
+            async with httpx.AsyncClient(timeout=40) as client:
+                r = await client.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": current_model, "messages": msgs, "max_tokens": max_tokens}
+                )
+                if r.status_code == 429:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"⚠️ Rate limit [{current_model}] → переключаю, жду {wait:.1f}с")
+                    _groq_model_index = (_groq_model_index + 1) % len(GROQ_MODELS)
+                    await asyncio.sleep(wait)
+                    continue
+                data = r.json()
+                if "choices" not in data:
+                    raise Exception(f"Groq error: {data}")
+                logger.info(f"✅ Groq [{current_model}]")
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower():
+                _groq_model_index = (_groq_model_index + 1) % len(GROQ_MODELS)
+                await asyncio.sleep(2)
+                continue
+            raise
+    return "⚠️ Все модели временно недоступны. Попробуй через минуту."
+
+# ═══ ВЕБ ПОИСК (НОВОЕ) ═══
+
+async def web_search(query: str) -> str:
+    """DuckDuckGo поиск — бесплатно без ключей"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": query,
+                    "format": "json",
+                    "no_html": "1",
+                    "skip_disambig": "1"
+                }
+            )
+            data = r.json()
+            results = []
+            if data.get("AbstractText"):
+                results.append(data["AbstractText"])
+            for topic in data.get("RelatedTopics", [])[:3]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append(topic["Text"])
+            if results:
+                raw = "\n".join(results)
+                summary = await groq_request(
+                    messages=[{"role": "user", "content":
+                        f"Ответь кратко на вопрос: {query}\n\nДанные:\n{raw}"}],
+                    max_tokens=400
+                )
+                return summary
+            return "Информация не найдена"
+    except Exception as e:
+        logger.error(f"web_search: {e}")
+        return f"Ошибка поиска: {e}"
 
 # ═══ БАЗА ДАННЫХ ═══
 
@@ -192,11 +264,38 @@ def init_db():
             amount_usd REAL DEFAULT 0, amount_rub REAL DEFAULT 0,
             description TEXT, created_at TEXT
         )''')
+        # Лог заказов (НОВОЕ)
+        c.execute('''CREATE TABLE IF NOT EXISTS jobs_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT UNIQUE,
+            title TEXT,
+            url TEXT,
+            status TEXT,
+            lila_decision TEXT,
+            lila_reason TEXT,
+            found_at TEXT,
+            source TEXT
+        )''')
         conn.commit()
         conn.close()
         logger.info("✅ БД инициализирована")
     except Exception as e:
         logger.error(f"init_db: {e}")
+
+def log_job_decision(project_id: str, title: str, url: str, source: str, decision: str, reason: str):
+    """Логируем каждое решение Лилы (НОВОЕ)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT OR IGNORE INTO jobs_log
+            (project_id, title, url, status, lila_decision, lila_reason, found_at, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (project_id, title, url, "processed", decision, reason,
+              msk_time_str(), source))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"log_job_decision: {e}")
 
 def get_stats() -> str:
     try:
@@ -214,6 +313,7 @@ def get_stats() -> str:
             e = {"found":"🔍","accepted":"✅","completed":"⚙️","done":"🏁","skipped":"⏭"}.get(status,"•")
             recent_text += f"  {e} {title[:40]} — {source}\n"
         return (f"\n═══ ДАННЫЕ СИСТЕМЫ ═══\n"
+                f"🕐 Время: {msk_time_str()}\n"
                 f"🔍 Найдено: {by_status.get('found',0)} | ✅ Принято: {by_status.get('accepted',0)} | 🏁 Выполнено: {by_status.get('done',0)}\n"
                 f"💰 Заработано: ${earn[0]:.2f} / ₽{earn[1]:.0f}\n"
                 f"Последние заказы:\n{recent_text or '  Пока нет'}")
@@ -345,9 +445,19 @@ async def get_lilu_response(user_id: int, text: str, image_b64: str = None) -> s
     if mem:
         system += f"\n\n═══ ПАМЯТЬ ═══\n{mem}"
 
+    # Добавляем текущее время МСК (НОВОЕ)
+    system += f"\n\n═══ ВРЕМЯ ═══\nСейчас: {msk_time_str()}"
+
     keywords = ["заказ", "полифан", "бухгалтер", "заработ", "доход", "статистик", "деньги", "сколько"]
     if any(kw in text.lower() for kw in keywords):
         system += get_stats()
+
+    # Веб поиск если просят (НОВОЕ)
+    search_keywords = ["найди", "поищи", "что такое", "кто такой", "узнай", "проверь в интернете", "загугли"]
+    if any(kw in text.lower() for kw in search_keywords):
+        query = text
+        search_result = await web_search(query)
+        system += f"\n\n═══ РЕЗУЛЬТАТ ПОИСКА ═══\n{search_result}"
 
     reply = await groq_request(
         messages=conversation_history[user_id],
@@ -371,34 +481,35 @@ async def lilu_check_text(text: str, task: str = "") -> str:
         max_tokens=600
     )
 
-# ═══ ФИЛЬТР ЗАКАЗОВ — ОБНОВЛЁННЫЙ ═══
+# ═══ ФИЛЬТР ЗАКАЗОВ — С ОБЪЯСНЕНИЕМ ПРИЧИНЫ (ОБНОВЛЕНО) ═══
 
 async def lilu_review_job(job: dict, source_bot: str) -> dict:
     title = job.get('title', '').lower()
     desc  = job.get('description', '').lower()
     text  = title + " " + desc
 
-    # ─── ЖЁСТКИЙ ФИЛЬТР — без AI, мгновенно ───
     HARD_REJECT = [
-        # Вакансии и найм
         "ищем сотрудника", "требуется сотрудник", "вакансия", "job posting",
         "hiring", "we are hiring", "full-time", "part-time", "salary",
         "director", "manager", "engineer wanted", "looking for a",
-        # Блогеры и инфлюенсеры
         "найти блогеров", "поиск блогеров", "find bloggers", "influencer search",
         "бартер с блогерами", "договориться с блогерами",
-        # Программирование
         "программирование", "разработка сайта", "мобильное приложение",
         "android", "ios", "flutter", "react", "python разработк",
-        # Другое не наше
         "видеомонтаж", "3d анимация", "чертёж", "autocad",
         "курсовая", "дипломная", "доставить", "курьер",
         "оформить ленту", "визуал аккаунта",
     ]
     for phrase in HARD_REJECT:
         if phrase in text:
-            logger.info(f"🚫 Жёсткий фильтр: '{phrase}' в '{job.get('title','')[:50]}'")
-            return {"can_do": False, "reason": f"Жёсткий фильтр: {phrase}"}
+            reason = f"Жёсткий фильтр: '{phrase}' — не наш профиль"
+            logger.info(f"🚫 {reason} в '{job.get('title','')[:50]}'")
+            # Логируем отказ (НОВОЕ)
+            log_job_decision(
+                job.get('id', ''), job.get('title', ''), job.get('url', ''),
+                source_bot, "ОТКАЗ", reason
+            )
+            return {"can_do": False, "reason": reason}
 
     prompt = f"""Ты Лила — CEO фриланс-команды. Оцени заказ.
 
@@ -406,11 +517,12 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
 ЗАГОЛОВОК: {job.get('title', '')}
 ОПИСАНИЕ: {job.get('description', '')[:600]}
 БЮДЖЕТ: {job.get('budget', 'не указан')}
+ВРЕМЯ МСК: {msk_time_str()}
 
 КОМАНДА УМЕЕТ:
 - Полифан: тексты, статьи, копирайтинг, рерайтинг, переводы на ВСЕ языки мира,
   посты соцсетей, email рассылки, лендинги, презентации (текст), proposals,
-  коммерческие предложения, сценарии
+  коммерческие предложения, сценарии, резюме, документы, SEO тексты
 - Карточник: карточки WB/Ozon/ЯМ/Amazon/Etsy, аудит карточек, семантика,
   UGC (отзывы/FAQ/ответы на негатив), векторизация JPG→SVG,
   наполнение сайтов через CSV/Excel, описания товаров
@@ -419,10 +531,10 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
 - Вакансии — если это объявление о найме сотрудника, не заказ на контент
 - Программирование, разработка сайтов, мобильные приложения
 - Видеомонтаж, 3D анимация, чертежи
-- Курсовые, дипломные работы
+- Курсовые, дипломные работы с антиплагиатом
 - Доставка, курьерские услуги
 - Поиск блогеров и ведение переговоров с ними
-- Ручной дизайн логотипов с нуля (векторизацию готового — умеем)
+- Ручной дизайн логотипов с нуля
 - Оформление ленты соцсетей (визуальный дизайн)
 
 ВАЖНО: нет верхнего лимита бюджета. Минимум: 200₽ / $3
@@ -434,18 +546,19 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
   "can_do": true,
   "who_does": "Полифан или Карточник",
   "time_estimate": "сколько времени",
-  "reason": "почему берём или отклоняем",
+  "reason": "ПОДРОБНО почему берём или отклоняем — минимум 2-3 предложения",
+  "risks": "риски если есть, или пусто",
   "requires_clarification": false,
   "clarification_questions": "вопросы клиенту если нужно",
   "lilu_comment": "живой комментарий Лилы 1-2 предложения"
 }}"""
 
     try:
-        await asyncio.sleep(1)  # защита от rate limit
+        await asyncio.sleep(1)
         text = await groq_request(
             messages=[{"role": "user", "content": prompt}],
             system=LILU_SYSTEM,
-            max_tokens=500
+            max_tokens=600
         )
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
@@ -455,7 +568,15 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
             start, end = text.find('{'), text.rfind('}')
             if start != -1 and end != -1:
                 text = text[start:end+1]
-        return json.loads(text)
+        result = json.loads(text)
+
+        # Логируем решение (НОВОЕ)
+        decision = "БЕРЁМ" if result.get('can_do') else "ОТКАЗ"
+        log_job_decision(
+            job.get('id', ''), job.get('title', ''), job.get('url', ''),
+            source_bot, decision, result.get('reason', '')
+        )
+        return result
     except Exception as e:
         logger.error(f"lilu_review_job: {e}")
         return {"can_do": False, "reason": f"Ошибка оценки: {e}"}
@@ -468,6 +589,10 @@ async def lilu_send_approved_job(bot, job: dict, review: dict, source_bot: str):
     if review.get('requires_clarification') and review.get('clarification_questions'):
         clarification = f"\n❓ *Уточнить у клиента:*\n_{review['clarification_questions']}_\n"
 
+    risks = ""
+    if review.get('risks'):
+        risks = f"\n⚠️ *Риски:* {review.get('risks')}\n"
+
     msg = (
         f"💼 *ЛИЛА ОДОБРИЛА ЗАКАЗ*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -477,7 +602,8 @@ async def lilu_send_approved_job(bot, job: dict, review: dict, source_bot: str):
         f"💰 Бюджет: *{job.get('budget', 'не указан')}*\n"
         f"⏱ Время: *{review.get('time_estimate', '?')}*\n"
         f"👷 Делает: *{who_emoji}*\n"
-        f"{clarification}\n"
+        f"{clarification}"
+        f"{risks}\n"
         f"💬 *Лила говорит:*\n_{review.get('lilu_comment', '')}_\n\n"
         f"🔗 [Открыть заказ]({job.get('url', '#')})\n"
         f"━━━━━━━━━━━━━━━━━━"
@@ -493,6 +619,27 @@ async def lilu_send_approved_job(bot, job: dict, review: dict, source_bot: str):
         disable_web_page_preview=True
     )
 
+async def lilu_send_rejected_job(bot, job: dict, review: dict, source_bot: str):
+    """Отправляем уведомление об отклонённом заказе с причиной (НОВОЕ)"""
+    source_emoji = "🤖 Полифан" if "Полифан" in source_bot else "🛍️ Карточник"
+    msg = (
+        f"❌ *ЛИЛА ОТКЛОНИЛА*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📡 {source_emoji}\n"
+        f"📌 {job.get('title','')[:80]}\n\n"
+        f"🚫 *Причина:*\n{review.get('reason', 'Не наш профиль')}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        await bot.send_message(
+            chat_id=YOUR_CHAT_ID,
+            text=msg,
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"lilu_send_rejected_job: {e}")
+
 async def process_incoming_job(bot, job: dict, source_bot: str):
     logger.info(f"📨 Лила получила от {source_bot}: {job.get('title','')[:50]}")
     review = await lilu_review_job(job, source_bot)
@@ -500,6 +647,19 @@ async def process_incoming_job(bot, job: dict, source_bot: str):
         await lilu_send_approved_job(bot, job, review, source_bot)
     else:
         logger.info(f"❌ Отклонила: {job.get('title','')[:50]} — {review.get('reason','')}")
+        # Отправляем причину отказа (НОВОЕ — можно отключить если слишком много сообщений)
+        # await lilu_send_rejected_job(bot, job, review, source_bot)
+
+# ═══ КОМАНДА ПОИСКА (НОВОЕ) ═══
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text("Используй: /search запрос\nПример: /search курс доллара сегодня")
+        return
+    await update.message.reply_text(f"🔍 Ищу: {query}...")
+    result = await web_search(query)
+    await update.message.reply_text(f"🌐 *Результат:*\n\n{result}", parse_mode='Markdown')
 
 # ═══ ГЛАВНОЕ МЕНЮ ═══
 
@@ -556,6 +716,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card_status = "🟢" if data['card_conv'] >= 15 else ("🟡" if data['card_conv'] >= 8 else "🔴")
     msg = (
         f"📊 *АНАЛИТИКА — {days} дней*\n\n"
+        f"🕐 {msk_time_str()}\n\n"
         f"🤖 *Полифан:* {data['poly_found']} найдено, конверсия {poly_status} {data['poly_conv']}%\n"
         f"🛍️ *Карточник:* {data['card_found']} найдено, конверсия {card_status} {data['card_conv']}%\n"
         f"💰 Доход: ${data['earn_usd']:.2f} / ₽{data['earn_rub']:.0f}\n"
@@ -743,6 +904,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_analytics":
         d = get_system_analytics(7)
         msg = (f"📊 *Аналитика за 7 дней*\n\n"
+               f"🕐 {msk_time_str()}\n\n"
                f"🤖 Полифан: {d.get('poly_found',0)} найдено, конверсия {d.get('poly_conv',0)}%\n"
                f"🛍️ Карточник: {d.get('card_found',0)} найдено, конверсия {d.get('card_conv',0)}%\n"
                f"💰 Доход: ${d.get('earn_usd',0):.2f} / ₽{d.get('earn_rub',0):.0f}")
@@ -849,11 +1011,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_system":
         d   = get_system_analytics(1)
         msg = (f"⚙️ *СИСТЕМА — сегодня*\n\n"
+               f"🕐 {msk_time_str()}\n\n"
                f"🤖 Полифан: {d.get('poly_found',0)} заказов найдено\n"
                f"🛍️ Карточник: {d.get('card_found',0)} заказов найдено\n"
                f"💰 Доход сегодня: ${d.get('earn_usd',0):.2f}\n\n"
                f"🟢 VPS: 132.243.228.167 (Франкфурт)\n"
-               f"🟢 Groq API: бесплатный\n"
+               f"🟢 Groq API: ротация 4 моделей\n"
                f"🟢 Все боты: работают")
         await query.edit_message_text(msg, parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Меню", callback_data="back_main")]]))
@@ -977,7 +1140,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Артём, я понимаю текст, голос и картинки 😊")
             return
 
-        # Режим проверки текста
         if context.user_data.get('checking_text') and user_text:
             context.user_data.pop('checking_text', None)
             await update.message.reply_text("🔍 Проверяю...")
@@ -985,7 +1147,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 *ПРОВЕРКА:*\n\n{check}", parse_mode='Markdown')
             return
 
-        # Режим КП
         if context.user_data.get('making_kp') and user_text:
             context.user_data.pop('making_kp', None)
             await update.message.reply_text("📋 Составляю КП...")
@@ -998,7 +1159,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📋 *КП:*\n\n{kp}", parse_mode='Markdown')
             return
 
-        # Режим анализа конкурентов
         if context.user_data.get('competitor_mode') and user_text:
             context.user_data.pop('competitor_mode', None)
             await update.message.reply_text("🔍 Анализирую...")
@@ -1011,7 +1171,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 *{user_text}*\n\n{analysis}", parse_mode='Markdown')
             return
 
-        # Режим скрипта продаж
         if context.user_data.get('script_mode') and user_text:
             context.user_data.pop('script_mode', None)
             await update.message.reply_text("💬 Пишу скрипт...")
@@ -1024,7 +1183,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"💬 *СКРИПТ:*\n\n{script}", parse_mode='Markdown')
             return
 
-        # Режим правки
         if context.user_data.get('lilu_fix_job'):
             context.user_data.pop('lilu_fix_job', None)
             await context.bot.send_message(
@@ -1035,10 +1193,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Отправила правки!")
             return
 
-        # Обычный разговор
         reply = await get_lilu_response(user_id, user_text, image_b64)
 
-        # Голосовой ответ
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
             audio = await text_to_speech(reply)
@@ -1139,24 +1295,27 @@ def main():
     app.add_handler(CommandHandler("skills",     skills_command))
     app.add_handler(CommandHandler("kwork",      kwork_command))
     app.add_handler(CommandHandler("video",      video_command))
+    app.add_handler(CommandHandler("search",     search_command))  # НОВОЕ
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO, handle_message))
 
     async def post_init(application):
         asyncio.create_task(lilu_db_poll_loop(application.bot))
         asyncio.create_task(lilu_proactive_loop(application.bot))
-        logger.info("✅ Лила v3: опрос БД запущен")
+        logger.info("✅ Лила v3.1: опрос БД запущен")
         try:
             if YOUR_CHAT_ID:
                 await application.bot.send_message(
                     chat_id=YOUR_CHAT_ID,
                     text=(
-                        "👑 *Лила v3.0 запущена!*\n\n"
-                        "✅ Groq — бесплатно, без лимитов\n"
-                        "✅ Полное меню в боте\n"
-                        "✅ Обновлённый фильтр заказов\n"
-                        "✅ Все языки мира\n\n"
-                        "Напиши /menu или просто пиши мне 🖤"
+                        f"👑 *Лила v3.1 запущена!*\n\n"
+                        f"🕐 {msk_time_str()}\n\n"
+                        f"✅ Groq — ротация 4 моделей\n"
+                        f"✅ Rate limit защита\n"
+                        f"✅ Время МСК везде\n"
+                        f"✅ Веб поиск /search\n"
+                        f"✅ Лог всех решений\n\n"
+                        f"Напиши /menu или просто пиши мне 🖤"
                     ),
                     parse_mode='Markdown'
                 )
@@ -1164,138 +1323,53 @@ def main():
             pass
 
     app.post_init = post_init
-    logger.info("👑 Лила v3.0 запущена на Groq!")
+    logger.info("👑 Лила v3.1 запущена!")
     app.run_polling()
+
+async def lilu_proactive_loop(bot):
+    await asyncio.sleep(120)
+    while True:
+        try:
+            now = msk_now()
+            if now.hour >= 20 or now.hour < 8:
+                await asyncio.sleep(3600)
+                continue
+            memory = load_memory()
+            last_ts = memory.get("last_proactive")
+            if last_ts:
+                if (now - datetime.fromisoformat(last_ts).replace(tzinfo=pytz.timezone('Europe/Moscow'))).total_seconds() < 10800:
+                    await asyncio.sleep(1800)
+                    continue
+            trigger_text = None
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                date_from = (datetime.now() - timedelta(hours=2)).isoformat()
+                c.execute("SELECT COUNT(*) FROM jobs WHERE created_at >= ? AND status=?", (date_from,"pending_lilu"))
+                recent_jobs = c.fetchone()[0]
+                conn.close()
+            except:
+                recent_jobs = 0
+            if recent_jobs >= 3:
+                trigger_text = await groq_request(
+                    messages=[{"role":"user","content":f"Ты Лила. Полифан нашел {recent_jobs} заказов. Напиши Артему живо. 2 предложения."}],
+                    system=LILU_SYSTEM, max_tokens=80)
+            if not trigger_text:
+                last_f = memory.get("last_fashion")
+                days = (now - datetime.fromisoformat(last_f).replace(tzinfo=pytz.timezone('Europe/Moscow'))).total_seconds()/86400 if last_f else 7
+                if days >= 2:
+                    trigger_text = await groq_request(
+                        messages=[{"role":"user","content":"Ты Лила. Напиши Артему живую мысль о бренде LS или контенте. 1-2 предложения."}],
+                        system=LILU_SYSTEM, max_tokens=80)
+                    memory["last_fashion"] = now.isoformat()
+                    save_memory(memory)
+            if trigger_text and trigger_text.strip():
+                await bot.send_message(chat_id=YOUR_CHAT_ID, text=trigger_text.strip())
+                memory["last_proactive"] = now.isoformat()
+                save_memory(memory)
+        except Exception as e:
+            logger.error(f"proactive_loop: {e}")
+        await asyncio.sleep(7200)
 
 if __name__ == "__main__":
     main()
-
-# ═══ ПРОАКТИВНЫЕ СООБЩЕНИЯ — ЖИВЫЕ, НЕ ПО РАСПИСАНИЮ ═══
-
-def get_recent_jobs_count(hours: int = 1) -> int:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        date_from = (datetime.now() - timedelta(hours=hours)).isoformat()
-        c.execute("SELECT COUNT(*) FROM jobs WHERE created_at >= ? AND status='pending_lilu'", (date_from,))
-        count = c.fetchone()[0]
-        conn.close()
-        return count
-    except:
-        return 0
-
-def get_last_proactive_time() -> datetime:
-    try:
-        memory = load_memory()
-        ts = memory.get("last_proactive")
-        if ts:
-            return datetime.fromisoformat(ts)
-    except:
-        pass
-    return datetime.now() - timedelta(hours=24)
-
-def save_last_proactive_time():
-    try:
-        memory = load_memory()
-        memory["last_proactive"] = datetime.now().isoformat()
-        save_memory(memory)
-    except:
-        pass
-
-def get_last_fashion_thought_time() -> datetime:
-    try:
-        memory = load_memory()
-        ts = memory.get("last_fashion")
-        if ts:
-            return datetime.fromisoformat(ts)
-    except:
-        pass
-    return datetime.now() - timedelta(days=7)
-
-def save_last_fashion_thought_time():
-    try:
-        memory = load_memory()
-        memory["last_fashion"] = datetime.now().isoformat()
-        save_memory(memory)
-    except:
-        pass
-
-async def lilu_proactive_loop(bot):
-    """
-    Лила пишет первой — только когда реально есть повод.
-    Не по расписанию. Как живой человек.
-    """
-    await asyncio.sleep(120)  # даём системе запуститься
-
-    while True:
-        try:
-            now = datetime.now()
-            last_proactive = get_last_proactive_time()
-            hours_since_last = (now - last_proactive).total_seconds() / 3600
-
-            # Не пишем чаще чем раз в 3 часа — не надоедаем
-            if hours_since_last < 3:
-                await asyncio.sleep(1800)
-                continue
-
-            # Не пишем ночью (23:00 - 07:00 МСК = 20:00 - 04:00 UTC)
-            hour_utc = now.hour
-            if hour_utc >= 20 or hour_utc < 4:
-                await asyncio.sleep(3600)
-                continue
-
-            trigger_text = None
-
-            # ─── ТРИГГЕР 1: Полифан нашёл много заказов ───
-            recent_jobs = get_recent_jobs_count(hours=2)
-            if recent_jobs >= 3:
-                trigger_text = await groq_request(
-                    messages=[{"role": "user", "content":
-                        f"Ты Лила — CEO. Полифан только что нашёл {recent_jobs} новых заказов за 2 часа. "
-                        f"Напиши Артёму короткое живое сообщение — как будто сама заметила и решила сказать. "
-                        f"Не шаблонно. В своём стиле. Максимум 2 предложения."}],
-                    system=LILU_SYSTEM, max_tokens=80
-                )
-
-            # ─── ТРИГГЕР 2: Долго нет дохода — деликатно ───
-            elif hours_since_last > 12:
-                stats = get_stats()
-                if "$0.00" in stats or "₽0" in stats:
-                    trigger_text = await groq_request(
-                        messages=[{"role": "user", "content":
-                            "Ты Лила. Пока тихо по деньгам — ни одного закрытого заказа. "
-                            "Напиши Артёму коротко и по-живому — не нагнетай, просто отметь. "
-                            "Может предложи что-то конкретное. 1-2 предложения."}],
-                        system=LILU_SYSTEM, max_tokens=80
-                    )
-
-            # ─── ТРИГГЕР 3: Мысль о бренде LS раз в 2-3 дня ───
-            last_fashion = get_last_fashion_thought_time()
-            days_since_fashion = (now - last_fashion).total_seconds() / 86400
-            if days_since_fashion >= 2 and not trigger_text:
-                import random
-                fashion_prompts = [
-                    "Ты Лила — Creative Director бренда LS. Придумай одну конкретную идею для коллекции или детали образа. Напиши Артёму как будто мысль пришла только что. 1-2 предложения.",
-                    "Ты Лила. Напиши Артёму мысль о логотипе LS или стиле бренда — живо, как будто только что увидела что-то вдохновляющее. 1-2 предложения.",
-                    "Ты Лила — Fashion Director. Напиши Артёму идею для контента Лилы в Dubai или London — конкретную, визуальную. Как будто представила образ прямо сейчас. 1-2 предложения.",
-                ]
-                trigger_text = await groq_request(
-                    messages=[{"role": "user", "content": random.choice(fashion_prompts)}],
-                    system=LILU_SYSTEM, max_tokens=80
-                )
-                save_last_fashion_thought_time()
-
-            # Отправляем если есть что сказать
-            if trigger_text and trigger_text.strip():
-                await bot.send_message(
-                    chat_id=YOUR_CHAT_ID,
-                    text=trigger_text.strip()
-                )
-                save_last_proactive_time()
-                logger.info("💬 Лила написала первой")
-
-        except Exception as e:
-            logger.error(f"proactive_loop: {e}")
-
-        # Проверяем каждые 2 часа
-        await asyncio.sleep(7200)
