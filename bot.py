@@ -1113,6 +1113,7 @@ def main():
 
     async def post_init(application):
         asyncio.create_task(lilu_db_poll_loop(application.bot))
+        asyncio.create_task(lilu_proactive_loop(application.bot))
         logger.info("✅ Лила v3: опрос БД запущен")
         try:
             if YOUR_CHAT_ID:
@@ -1137,3 +1138,133 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ═══ ПРОАКТИВНЫЕ СООБЩЕНИЯ — ЖИВЫЕ, НЕ ПО РАСПИСАНИЮ ═══
+
+def get_recent_jobs_count(hours: int = 1) -> int:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        date_from = (datetime.now() - timedelta(hours=hours)).isoformat()
+        c.execute("SELECT COUNT(*) FROM jobs WHERE created_at >= ? AND status='pending_lilu'", (date_from,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except:
+        return 0
+
+def get_last_proactive_time() -> datetime:
+    try:
+        memory = load_memory()
+        ts = memory.get("last_proactive")
+        if ts:
+            return datetime.fromisoformat(ts)
+    except:
+        pass
+    return datetime.now() - timedelta(hours=24)
+
+def save_last_proactive_time():
+    try:
+        memory = load_memory()
+        memory["last_proactive"] = datetime.now().isoformat()
+        save_memory(memory)
+    except:
+        pass
+
+def get_last_fashion_thought_time() -> datetime:
+    try:
+        memory = load_memory()
+        ts = memory.get("last_fashion")
+        if ts:
+            return datetime.fromisoformat(ts)
+    except:
+        pass
+    return datetime.now() - timedelta(days=7)
+
+def save_last_fashion_thought_time():
+    try:
+        memory = load_memory()
+        memory["last_fashion"] = datetime.now().isoformat()
+        save_memory(memory)
+    except:
+        pass
+
+async def lilu_proactive_loop(bot):
+    """
+    Лила пишет первой — только когда реально есть повод.
+    Не по расписанию. Как живой человек.
+    """
+    await asyncio.sleep(120)  # даём системе запуститься
+
+    while True:
+        try:
+            now = datetime.now()
+            last_proactive = get_last_proactive_time()
+            hours_since_last = (now - last_proactive).total_seconds() / 3600
+
+            # Не пишем чаще чем раз в 3 часа — не надоедаем
+            if hours_since_last < 3:
+                await asyncio.sleep(1800)
+                continue
+
+            # Не пишем ночью (23:00 - 07:00 МСК = 20:00 - 04:00 UTC)
+            hour_utc = now.hour
+            if hour_utc >= 20 or hour_utc < 4:
+                await asyncio.sleep(3600)
+                continue
+
+            trigger_text = None
+
+            # ─── ТРИГГЕР 1: Полифан нашёл много заказов ───
+            recent_jobs = get_recent_jobs_count(hours=2)
+            if recent_jobs >= 3:
+                trigger_text = await groq_request(
+                    messages=[{"role": "user", "content":
+                        f"Ты Лила — CEO. Полифан только что нашёл {recent_jobs} новых заказов за 2 часа. "
+                        f"Напиши Артёму короткое живое сообщение — как будто сама заметила и решила сказать. "
+                        f"Не шаблонно. В своём стиле. Максимум 2 предложения."}],
+                    system=LILU_SYSTEM, max_tokens=80
+                )
+
+            # ─── ТРИГГЕР 2: Долго нет дохода — деликатно ───
+            elif hours_since_last > 12:
+                stats = get_stats()
+                if "$0.00" in stats or "₽0" in stats:
+                    trigger_text = await groq_request(
+                        messages=[{"role": "user", "content":
+                            "Ты Лила. Пока тихо по деньгам — ни одного закрытого заказа. "
+                            "Напиши Артёму коротко и по-живому — не нагнетай, просто отметь. "
+                            "Может предложи что-то конкретное. 1-2 предложения."}],
+                        system=LILU_SYSTEM, max_tokens=80
+                    )
+
+            # ─── ТРИГГЕР 3: Мысль о бренде LS раз в 2-3 дня ───
+            last_fashion = get_last_fashion_thought_time()
+            days_since_fashion = (now - last_fashion).total_seconds() / 86400
+            if days_since_fashion >= 2 and not trigger_text:
+                import random
+                fashion_prompts = [
+                    "Ты Лила — Creative Director бренда LS. Придумай одну конкретную идею для коллекции или детали образа. Напиши Артёму как будто мысль пришла только что. 1-2 предложения.",
+                    "Ты Лила. Напиши Артёму мысль о логотипе LS или стиле бренда — живо, как будто только что увидела что-то вдохновляющее. 1-2 предложения.",
+                    "Ты Лила — Fashion Director. Напиши Артёму идею для контента Лилы в Dubai или London — конкретную, визуальную. Как будто представила образ прямо сейчас. 1-2 предложения.",
+                ]
+                trigger_text = await groq_request(
+                    messages=[{"role": "user", "content": random.choice(fashion_prompts)}],
+                    system=LILU_SYSTEM, max_tokens=80
+                )
+                save_last_fashion_thought_time()
+
+            # Отправляем если есть что сказать
+            if trigger_text and trigger_text.strip():
+                await bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text=trigger_text.strip()
+                )
+                save_last_proactive_time()
+                logger.info("💬 Лила написала первой")
+
+        except Exception as e:
+            logger.error(f"proactive_loop: {e}")
+
+        # Проверяем каждые 2 часа
+        await asyncio.sleep(7200)
