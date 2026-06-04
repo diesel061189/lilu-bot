@@ -374,6 +374,32 @@ async def lilu_check_text(text: str, task: str = "") -> str:
 # ═══ ФИЛЬТР ЗАКАЗОВ — ОБНОВЛЁННЫЙ ═══
 
 async def lilu_review_job(job: dict, source_bot: str) -> dict:
+    title = job.get('title', '').lower()
+    desc  = job.get('description', '').lower()
+    text  = title + " " + desc
+
+    # ─── ЖЁСТКИЙ ФИЛЬТР — без AI, мгновенно ───
+    HARD_REJECT = [
+        # Вакансии и найм
+        "ищем сотрудника", "требуется сотрудник", "вакансия", "job posting",
+        "hiring", "we are hiring", "full-time", "part-time", "salary",
+        "director", "manager", "engineer wanted", "looking for a",
+        # Блогеры и инфлюенсеры
+        "найти блогеров", "поиск блогеров", "find bloggers", "influencer search",
+        "бартер с блогерами", "договориться с блогерами",
+        # Программирование
+        "программирование", "разработка сайта", "мобильное приложение",
+        "android", "ios", "flutter", "react", "python разработк",
+        # Другое не наше
+        "видеомонтаж", "3d анимация", "чертёж", "autocad",
+        "курсовая", "дипломная", "доставить", "курьер",
+        "оформить ленту", "визуал аккаунта",
+    ]
+    for phrase in HARD_REJECT:
+        if phrase in text:
+            logger.info(f"🚫 Жёсткий фильтр: '{phrase}' в '{job.get('title','')[:50]}'")
+            return {"can_do": False, "reason": f"Жёсткий фильтр: {phrase}"}
+
     prompt = f"""Ты Лила — CEO фриланс-команды. Оцени заказ.
 
 ИСТОЧНИК: {source_bot}
@@ -383,23 +409,23 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
 
 КОМАНДА УМЕЕТ:
 - Полифан: тексты, статьи, копирайтинг, рерайтинг, переводы на ВСЕ языки мира,
-  посты соцсетей, email рассылки, лендинги, презентации (текст), proposals
+  посты соцсетей, email рассылки, лендинги, презентации (текст), proposals,
+  коммерческие предложения, сценарии
 - Карточник: карточки WB/Ozon/ЯМ/Amazon/Etsy, аудит карточек, семантика,
   UGC (отзывы/FAQ/ответы на негатив), векторизация JPG→SVG,
   наполнение сайтов через CSV/Excel, описания товаров
 
 НЕ УМЕЕМ (отклоняй):
+- Вакансии — если это объявление о найме сотрудника, не заказ на контент
 - Программирование, разработка сайтов, мобильные приложения
-- Видеомонтаж, 3D анимация
-- Чертежи, AutoCAD
+- Видеомонтаж, 3D анимация, чертежи
 - Курсовые, дипломные работы
 - Доставка, курьерские услуги
-- Ручной дизайн логотипов (векторизацию умеем, дизайн с нуля — нет)
+- Поиск блогеров и ведение переговоров с ними
+- Ручной дизайн логотипов с нуля (векторизацию готового — умеем)
 - Оформление ленты соцсетей (визуальный дизайн)
-- Загрузка товаров вручную через чужую CMS с доступом к аккаунту
 
-ВАЖНО: нет верхнего лимита бюджета — дорогой заказ хорошо, просто уточняем детали.
-Минимальный бюджет: 200₽ / $3
+ВАЖНО: нет верхнего лимита бюджета. Минимум: 200₽ / $3
 
 Ответь ТОЛЬКО JSON:
 {{
@@ -415,6 +441,7 @@ async def lilu_review_job(job: dict, source_bot: str) -> dict:
 }}"""
 
     try:
+        await asyncio.sleep(1)  # защита от rate limit
         text = await groq_request(
             messages=[{"role": "user", "content": prompt}],
             system=LILU_SYSTEM,
@@ -922,7 +949,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(tmp.name, "rb") as f:
                     image_b64 = base64.b64encode(f.read()).decode()
                 os.unlink(tmp.name)
-            user_text = update.message.caption or "Что на картинке?"
+            caption   = update.message.caption or ""
+            user_text = caption if caption else "Ты прислал фото без подписи. Что с ним делать?"
+            if not caption:
+                await update.message.reply_text("📸 Фото получила! Напиши что на фото или что нужно — отвечу!")
+                return
 
         elif update.message.voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
