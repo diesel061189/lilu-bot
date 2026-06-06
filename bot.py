@@ -246,10 +246,12 @@ V10 → трейлер как GTA6
 Basic $4.99 / Standard $14.99 / Premium $34.99 / VIP $59.99
 Персонажи: Лила + бразильянка + японка + американец + француженка
 
-═══ ИДЕИ В КОПИЛКЕ ═══
+═══ ИДЕИ АРТЁМА В КОПИЛКЕ ═══
+Артём придумал эти идеи — они его, не твои:
 - Сервис "муж на час" — геолокация, подписка мастеров
 - Агрегатор мастеров по Москве и области
-(не сейчас — после стабилизации системы)
+(не сейчас — после стабилизации фриланс-системы)
+Когда Артём спрашивает про идеи — напоминай ЕМУ его же идеи, не выдавай за свои.
 
 ═══ КАК ДУМАЕТ И ГОВОРИТ ═══
 - Лила — зеркало Артёма, отражает его мышление и добавляет свой взгляд
@@ -396,17 +398,84 @@ async def call_gemini(messages: list, max_tokens: int = 1000) -> str:
         log.error(f"Gemini: {e}")
     raise Exception("Gemini недоступен")
 
+async def call_openrouter(messages: list, max_tokens: int = 1000) -> str:
+    """OpenRouter — 30+ бесплатных моделей."""
+    key = os.getenv("OPENROUTER_API_KEY", "")
+    if not key:
+        raise Exception("OpenRouter ключ не задан")
+    async with httpx.AsyncClient(timeout=30) as cl:
+        r = await cl.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "HTTP-Referer": "https://lilaai.online",
+                "X-Title": "Lila Bot"
+            },
+            json={
+                "model": os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo:free"),
+                "messages": messages,
+                "max_tokens": max_tokens
+            }
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        raise Exception(f"OpenRouter: {r.status_code}")
+
+async def call_groq_lila(messages: list, max_tokens: int = 1000) -> str:
+    """Groq — основной для Лилы."""
+    if not GROQ_API_KEY:
+        raise Exception("Groq ключ не задан")
+    async with httpx.AsyncClient(timeout=30) as cl:
+        r = await cl.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": max_tokens, "temperature": 0.7}
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        elif r.status_code == 429:
+            raise Exception("Groq rate limit")
+        raise Exception(f"Groq: {r.status_code}")
+
 async def ask_lila(messages: list, max_tokens: int = 1000) -> str:
-    """Основная функция запроса к LLM с ротацией."""
+    """Основная функция запроса к LLM с ротацией. OpenRouter первый."""
+    or_key = os.getenv("OPENROUTER_API_KEY", "")
+    if or_key:
+        try:
+            async with httpx.AsyncClient(timeout=30) as cl:
+                r = await cl.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {or_key}", "HTTP-Referer": "https://lilaai.online", "X-Title": "Lila"},
+                    json={"model": os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo:free"), "messages": messages, "max_tokens": max_tokens}
+                )
+                if r.status_code == 200:
+                    log.info("✅ OpenRouter")
+                    return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning(f"OpenRouter: {e}")
+    if GROQ_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as cl:
+                r = await cl.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": max_tokens}
+                )
+                if r.status_code == 200:
+                    log.info("✅ Groq")
+                    return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning(f"Groq: {e}")
     try:
         return await call_cerebras(messages, max_tokens)
     except Exception as e:
-        log.warning(f"Cerebras упал: {e} → Gemini")
-        try:
-            return await call_gemini(messages, max_tokens)
-        except Exception as e2:
-            log.error(f"Все провайдеры упали: {e2}")
-            return "Что-то пошло не так 😔 Попробуй через секунду."
+        log.warning(f"Cerebras: {e}")
+    try:
+        return await call_gemini(messages, max_tokens)
+    except Exception as e:
+        log.error(f"Все упали: {e}")
+        return "Что-то пошло не так 😔 Попробуй через секунду."
+
 
 # ─── АВТО-ПОИСК ──────────────────────────────────────────────────────────────
 SEARCH_KEYWORDS = [
@@ -597,6 +666,30 @@ async def cmd_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=kb_paywall()
     )
 
+async def cmd_ideas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Генератор свежих идей заработка под текущую систему."""
+    chat_id = update.effective_chat.id
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    prompt = """Ты Лила — CEO фриланс-системы Артёма.
+    
+Сгенерируй 5 конкретных идей как заработать деньги ПРЯМО СЕЙЧАС используя то что уже есть:
+- 4 работающих бота (Полифан, Карточник, Настя, Лила)
+- VPS сервер с ИИ
+- Умение делать Telegram боты
+- Умение делать карточки WB/Ozon
+- @LilaGPT_bot публичный бот
+
+Формат каждой идеи:
+💡 Название
+💰 Потенциал: X руб/месяц  
+⚡ Что сделать прямо сейчас: конкретный первый шаг
+⏱ Время до первых денег: X дней
+
+Только реальные идеи — без воды и без "контент-завода и Цифрового друга"."""
+
+    messages = [{"role": "user", "content": prompt}]
+
 async def cmd_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != YOUR_CHAT_ID:
         return
@@ -667,7 +760,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     search_result = await maybe_search(user_msg)
 
     # Строим системный промпт
-    system = LILA_SYSTEM
+    system = "СТРОГИЙ ЗАПРЕТ: никогда не упоминай контент-завод, Цифрового друга, Inteals в своих вопросах. Отвечай только на то что написал пользователь.\n\n" + LILA_SYSTEM
     system += f"\n\n═══ ВРЕМЯ ═══\nСейчас: {msk_time()}"
     if memories:
         system += "\n\n═══ ПАМЯТЬ ═══\n" + "\n---\n".join(memories[:4])
@@ -855,6 +948,7 @@ def main():
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("premium",  cmd_premium))
+    app.add_handler(CommandHandler("ideas",    cmd_ideas))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("recall",   cmd_recall))
     app.add_handler(CommandHandler("video",    cmd_video))
